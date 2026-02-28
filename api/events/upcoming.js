@@ -20,7 +20,9 @@ export default async function handler(req, res) {
 
     const days = Math.min(parseInt(req.query.days || "30", 10), 180);
     const limit = Math.min(parseInt(req.query.limit || "25", 10), 100);
-    const includeRegistrations = String(req.query.include_registrations || "1") !== "0";
+
+    // registrations opt-in via query param
+    const includeRegistrations = String(req.query.include_registrations || "0") === "1";
     const debug = String(req.query.debug || "0") === "1";
 
     const now = new Date();
@@ -33,66 +35,103 @@ export default async function handler(req, res) {
 
     async function fetchJson(url) {
       const resp = await fetch(url, { headers });
+      const text = await resp.text();
       if (!resp.ok) {
-        const text = await resp.text();
         throw new Error(`PCO request failed (${resp.status}): ${text}`);
       }
-      return await resp.json();
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new Error(`PCO returned non-JSON: ${text}`);
+      }
     }
 
-    async function getUpcomingCalendarEvents() {
-      const collected = [];
+    // ---- CALENDAR: pull event instances (occurrences) ----
+    async function getUpcomingCalendarInstances() {
       const perPage = 100;
-      const maxPages = 15; // scan deeper
+      const maxEventPages = 10; // parent events pages
+      const maxInstancePages = 3; // instances per event
+      const instanceLimitPerEvent = 50;
 
-      let scanned = 0;
-      let kept = 0;
-      let firstFewStarts = [];
+      const collected = [];
+      let parentEventsScanned = 0;
+      let instancesScanned = 0;
 
-      for (let page = 1; page <= maxPages; page++) {
-        const url = `https://api.planningcenteronline.com/calendar/v2/events?per_page=${perPage}&page=${page}`;
-        const json = await fetchJson(url);
+      // fetch parent events (containers)
+      for (let page = 1; page <= maxEventPages; page++) {
+        const eventsUrl = `https://api.planningcenteronline.com/calendar/v2/events?per_page=${perPage}&page=${page}`;
+        const eventsJson = await fetchJson(eventsUrl);
+        const parents = eventsJson?.data || [];
+        parentEventsScanned += parents.length;
 
-        const raw = json?.data || [];
-        scanned += raw.length;
+        // For each parent event, fetch its instances
+        for (const ev of parents) {
+          const eventId = ev.id;
+          const evAttr = ev.attributes || {};
+          const eventName = evAttr.name || "";
+          const eventDesc = evAttr.description || "";
+          const eventLocation = evAttr.location || "";
+          const eventUrl = evAttr.url || "";
+          const eventRegUrl = evAttr.registration_url || "";
 
-        const mapped = raw.map((e) => {
-          const a = e.attributes || {};
-          return {
-            source: "calendar",
-            id: e.id,
-            name: a.name || "",
-            description: a.description || "",
-            start_time: a.starts_at || "",
-            end_time: a.ends_at || "",
-            location: a.location || "",
-            registration_url: a.registration_url || a.url || ""
-          };
-        });
+          // Pull instances for this event
+          let instanceCountForThisEvent = 0;
+          for (let ip = 1; ip <= maxInstancePages; ip++) {
+            const instUrl =
+              `https://api.planningcenteronline.com/calendar/v2/events/${eventId}/event_instances?per_page=${perPage}&page=${ip}`;
+            const instJson = await fetchJson(instUrl);
+            const instances = instJson?.data || [];
 
-        if (debug && firstFewStarts.length < 20) {
-          for (const m of mapped) {
-            if (m.start_time) firstFewStarts.push(m.start_time);
-            if (firstFewStarts.length >= 20) break;
+            instancesScanned += instances.length;
+
+            const mapped = instances
+              .map((inst) => {
+                const a = inst.attributes || {};
+                return {
+                  source: "calendar",
+                  id: `${eventId}:${inst.id}`,
+                  name: eventName || a.name || "",
+                  description: eventDesc || "",
+                  start_time: a.starts_at || "",
+                  end_time: a.ends_at || "",
+                  location: a.location || eventLocation || "",
+                  registration_url: eventRegUrl || eventUrl || ""
+                };
+              })
+              .filter((e) => {
+                if (!e.start_time) return false;
+                const dt = new Date(e.start_time);
+                return dt >= now && dt <= cutoff;
+              });
+
+            collected.push(...mapped);
+
+            instanceCountForThisEvent += instances.length;
+            if (collected.length >= limit) break;
+            if (instances.length < perPage) break; // no more instance pages
+            if (instanceCountForThisEvent >= instanceLimitPerEvent) break;
           }
+
+          if (collected.length >= limit) break;
         }
 
-        const upcoming = mapped.filter((e) => {
-          if (!e.start_time) return false;
-          const dt = new Date(e.start_time);
-          return dt >= now && dt <= cutoff;
-        });
-
-        kept += upcoming.length;
-        collected.push(...upcoming);
-
         if (collected.length >= limit) break;
-        if (raw.length < perPage) break; // no more pages
+        if (parents.length < perPage) break; // no more event pages
       }
 
-      return { events: collected, scanned, kept, firstFewStarts };
+      // sort + trim
+      const sorted = collected
+        .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+        .slice(0, limit);
+
+      return {
+        events: sorted,
+        parentEventsScanned,
+        instancesScanned
+      };
     }
 
+    // ---- REGISTRATIONS (optional; best-effort) ----
     async function getUpcomingRegistrations() {
       const collected = [];
       const perPage = 100;
@@ -144,10 +183,12 @@ export default async function handler(req, res) {
         if ((json?.data || []).length < perPage) break;
       }
 
-      return collected;
+      return collected
+        .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+        .slice(0, limit);
     }
 
-    const cal = await getUpcomingCalendarEvents();
+    const cal = await getUpcomingCalendarInstances();
 
     let registrationEvents = [];
     if (includeRegistrations) {
@@ -171,9 +212,10 @@ export default async function handler(req, res) {
 
     if (debug) {
       response.debug = {
-        calendar_scanned: cal.scanned,
-        calendar_kept: cal.kept,
-        sample_calendar_starts_at: cal.firstFewStarts
+        calendar_parent_events_scanned: cal.parentEventsScanned,
+        calendar_instances_scanned: cal.instancesScanned,
+        returned_calendar_events: cal.events.length,
+        returned_registration_events: registrationEvents.length
       };
     }
 
