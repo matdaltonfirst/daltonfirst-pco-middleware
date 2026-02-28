@@ -46,36 +46,59 @@ export default async function handler(req, res) {
       }
     }
 
+    function stripHtml(html) {
+      if (!html) return "";
+      // very small + safe html strip (good enough for PCO descriptions)
+      return String(html)
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+
+    function toEasternDisplay(isoString) {
+      if (!isoString) return "";
+      const d = new Date(isoString);
+      // Format in America/New_York for your comms team
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+      }).format(d);
+    }
+
     // ---- CALENDAR: pull event instances (occurrences) ----
     async function getUpcomingCalendarInstances() {
       const perPage = 100;
       const maxEventPages = 10; // parent events pages
-      const maxInstancePages = 3; // instances per event
-      const instanceLimitPerEvent = 50;
+      const maxInstancePages = 4; // instances per event
+      const instanceLimitPerEvent = 200;
 
       const collected = [];
       let parentEventsScanned = 0;
       let instancesScanned = 0;
 
-      // fetch parent events (containers)
       for (let page = 1; page <= maxEventPages; page++) {
         const eventsUrl = `https://api.planningcenteronline.com/calendar/v2/events?per_page=${perPage}&page=${page}`;
         const eventsJson = await fetchJson(eventsUrl);
         const parents = eventsJson?.data || [];
         parentEventsScanned += parents.length;
 
-        // For each parent event, fetch its instances
         for (const ev of parents) {
           const eventId = ev.id;
           const evAttr = ev.attributes || {};
           const eventName = evAttr.name || "";
-          const eventDesc = evAttr.description || "";
+          const eventDescHtml = evAttr.description || "";
           const eventLocation = evAttr.location || "";
           const eventUrl = evAttr.url || "";
           const eventRegUrl = evAttr.registration_url || "";
 
-          // Pull instances for this event
           let instanceCountForThisEvent = 0;
+
           for (let ip = 1; ip <= maxInstancePages; ip++) {
             const instUrl =
               `https://api.planningcenteronline.com/calendar/v2/events/${eventId}/event_instances?per_page=${perPage}&page=${ip}`;
@@ -87,13 +110,19 @@ export default async function handler(req, res) {
             const mapped = instances
               .map((inst) => {
                 const a = inst.attributes || {};
+                const start = a.starts_at || "";
+                const end = a.ends_at || "";
                 return {
                   source: "calendar",
                   id: `${eventId}:${inst.id}`,
                   name: eventName || a.name || "",
-                  description: eventDesc || "",
-                  start_time: a.starts_at || "",
-                  end_time: a.ends_at || "",
+                  description_html: eventDescHtml || "",
+                  description_text: stripHtml(eventDescHtml || ""),
+                  start_time: start,
+                  end_time: end,
+                  start_epoch: start ? new Date(start).getTime() : null,
+                  start_local: toEasternDisplay(start),
+                  end_local: toEasternDisplay(end),
                   location: a.location || eventLocation || "",
                   registration_url: eventRegUrl || eventUrl || ""
                 };
@@ -108,7 +137,7 @@ export default async function handler(req, res) {
 
             instanceCountForThisEvent += instances.length;
             if (collected.length >= limit) break;
-            if (instances.length < perPage) break; // no more instance pages
+            if (instances.length < perPage) break;
             if (instanceCountForThisEvent >= instanceLimitPerEvent) break;
           }
 
@@ -116,12 +145,11 @@ export default async function handler(req, res) {
         }
 
         if (collected.length >= limit) break;
-        if (parents.length < perPage) break; // no more event pages
+        if (parents.length < perPage) break;
       }
 
-      // sort + trim
       const sorted = collected
-        .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+        .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
         .slice(0, limit);
 
       return {
@@ -144,6 +172,7 @@ export default async function handler(req, res) {
         const regs = (json?.data || [])
           .map((r) => {
             const a = r.attributes || {};
+
             const startGuess =
               a.starts_at ||
               a.start_at ||
@@ -160,13 +189,19 @@ export default async function handler(req, res) {
               a.closes_at ||
               "";
 
+            const descHtml = a.description || "";
+
             return {
               source: "registrations",
               id: r.id,
               name: a.name || a.title || "",
-              description: a.description || "",
+              description_html: descHtml,
+              description_text: stripHtml(descHtml),
               start_time: startGuess,
               end_time: endGuess,
+              start_epoch: startGuess ? new Date(startGuess).getTime() : null,
+              start_local: toEasternDisplay(startGuess),
+              end_local: toEasternDisplay(endGuess),
               location: a.location || "",
               registration_url: a.public_url || a.url || a.registration_url || ""
             };
@@ -184,7 +219,7 @@ export default async function handler(req, res) {
       }
 
       return collected
-        .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+        .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
         .slice(0, limit);
     }
 
@@ -200,13 +235,14 @@ export default async function handler(req, res) {
     }
 
     const merged = [...cal.events, ...registrationEvents]
-      .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
+      .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
       .slice(0, limit);
 
     const response = {
       days,
       limit,
       include_registrations: includeRegistrations,
+      timezone: "America/New_York",
       events: merged
     };
 
