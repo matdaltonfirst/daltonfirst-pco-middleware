@@ -18,11 +18,10 @@ export default async function handler(req, res) {
 
     const auth = Buffer.from(`${PCO_APP_ID}:${PCO_SECRET}`).toString("base64");
 
-    // Optional query params:
-    // /api/events/upcoming?days=30&limit=25&include_registrations=1
     const days = Math.min(parseInt(req.query.days || "30", 10), 180);
     const limit = Math.min(parseInt(req.query.limit || "25", 10), 100);
     const includeRegistrations = String(req.query.include_registrations || "1") !== "0";
+    const debug = String(req.query.debug || "0") === "1";
 
     const now = new Date();
     const cutoff = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
@@ -32,7 +31,6 @@ export default async function handler(req, res) {
       Accept: "application/json"
     };
 
-    // ---- Helper: fetch JSON with error details ----
     async function fetchJson(url) {
       const resp = await fetch(url, { headers });
       if (!resp.ok) {
@@ -42,60 +40,63 @@ export default async function handler(req, res) {
       return await resp.json();
     }
 
-    // ---- 1) CALENDAR EVENTS (paginate until we collect enough upcoming) ----
     async function getUpcomingCalendarEvents() {
       const collected = [];
-
-      // Pull multiple pages because PCO often returns older events first
-      // We'll stop when we have enough, or we hit max pages.
       const perPage = 100;
-      const maxPages = 6; // up to 600 events scanned
+      const maxPages = 15; // scan deeper
+
+      let scanned = 0;
+      let kept = 0;
+      let firstFewStarts = [];
 
       for (let page = 1; page <= maxPages; page++) {
         const url = `https://api.planningcenteronline.com/calendar/v2/events?per_page=${perPage}&page=${page}`;
         const json = await fetchJson(url);
 
-        const pageEvents = (json?.data || [])
-          .map((e) => {
-            const a = e.attributes || {};
-            return {
-              source: "calendar",
-              id: e.id,
-              name: a.name || "",
-              description: a.description || "",
-              start_time: a.starts_at || "",
-              end_time: a.ends_at || "",
-              location: a.location || "",
-              registration_url: a.registration_url || a.url || ""
-            };
-          })
-          .filter((e) => {
-            if (!e.start_time) return false;
-            const dt = new Date(e.start_time);
-            return dt >= now && dt <= cutoff;
-          });
+        const raw = json?.data || [];
+        scanned += raw.length;
 
-        collected.push(...pageEvents);
+        const mapped = raw.map((e) => {
+          const a = e.attributes || {};
+          return {
+            source: "calendar",
+            id: e.id,
+            name: a.name || "",
+            description: a.description || "",
+            start_time: a.starts_at || "",
+            end_time: a.ends_at || "",
+            location: a.location || "",
+            registration_url: a.registration_url || a.url || ""
+          };
+        });
 
-        // If we’re already beyond what we need, stop early
+        if (debug && firstFewStarts.length < 20) {
+          for (const m of mapped) {
+            if (m.start_time) firstFewStarts.push(m.start_time);
+            if (firstFewStarts.length >= 20) break;
+          }
+        }
+
+        const upcoming = mapped.filter((e) => {
+          if (!e.start_time) return false;
+          const dt = new Date(e.start_time);
+          return dt >= now && dt <= cutoff;
+        });
+
+        kept += upcoming.length;
+        collected.push(...upcoming);
+
         if (collected.length >= limit) break;
-
-        // If this page returned nothing at all, still continue a bit
-        // (sometimes future events are buried)
-        if ((json?.data || []).length < perPage) break; // no more pages
+        if (raw.length < perPage) break; // no more pages
       }
 
-      return collected;
+      return { events: collected, scanned, kept, firstFewStarts };
     }
 
-    // ---- 2) REGISTRATIONS (these are often the “real” promo events) ----
-    // We’ll pull registrations and map what we can.
-    // Different churches configure registrations differently, so we keep it flexible.
     async function getUpcomingRegistrations() {
       const collected = [];
-
       const perPage = 100;
-      const maxPages = 4;
+      const maxPages = 6;
 
       for (let page = 1; page <= maxPages; page++) {
         const url = `https://api.planningcenteronline.com/registrations/v2/registrations?per_page=${perPage}&page=${page}`;
@@ -104,8 +105,6 @@ export default async function handler(req, res) {
         const regs = (json?.data || [])
           .map((r) => {
             const a = r.attributes || {};
-
-            // These fields vary; we’ll do best-effort and keep the important bits.
             const startGuess =
               a.starts_at ||
               a.start_at ||
@@ -134,8 +133,6 @@ export default async function handler(req, res) {
             };
           })
           .filter((e) => {
-            // Only include registrations that appear to be upcoming within the window.
-            // If we can’t detect a start_time, we skip it (keeps the feed clean).
             if (!e.start_time) return false;
             const dt = new Date(e.start_time);
             return dt >= now && dt <= cutoff;
@@ -150,20 +147,37 @@ export default async function handler(req, res) {
       return collected;
     }
 
-    // Pull + merge
-    const calendarEvents = await getUpcomingCalendarEvents();
-    const registrationEvents = includeRegistrations ? await getUpcomingRegistrations() : [];
+    const cal = await getUpcomingCalendarEvents();
 
-    const merged = [...calendarEvents, ...registrationEvents]
+    let registrationEvents = [];
+    if (includeRegistrations) {
+      try {
+        registrationEvents = await getUpcomingRegistrations();
+      } catch {
+        registrationEvents = [];
+      }
+    }
+
+    const merged = [...cal.events, ...registrationEvents]
       .sort((a, b) => new Date(a.start_time) - new Date(b.start_time))
       .slice(0, limit);
 
-    return res.status(200).json({
+    const response = {
       days,
       limit,
       include_registrations: includeRegistrations,
       events: merged
-    });
+    };
+
+    if (debug) {
+      response.debug = {
+        calendar_scanned: cal.scanned,
+        calendar_kept: cal.kept,
+        sample_calendar_starts_at: cal.firstFewStarts
+      };
+    }
+
+    return res.status(200).json(response);
   } catch (err) {
     console.error(err);
     return res.status(500).json({
