@@ -46,21 +46,34 @@ export default async function handler(req, res) {
       }
     }
 
+    function decodeEntities(text) {
+      if (!text) return "";
+      return String(text)
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">");
+    }
+
     function stripHtml(html) {
       if (!html) return "";
-      // very small + safe html strip (good enough for PCO descriptions)
-      return String(html)
+      const stripped = String(html)
         .replace(/<br\s*\/?>/gi, "\n")
         .replace(/<\/p>/gi, "\n")
+        .replace(/<\/li>/gi, "\n")
+        .replace(/<li>/gi, "- ")
         .replace(/<[^>]+>/g, "")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
+
+      return decodeEntities(stripped).replace(/[ \t]{2,}/g, " ").trim();
     }
 
     function toEasternDisplay(isoString) {
       if (!isoString) return "";
       const d = new Date(isoString);
-      // Format in America/New_York for your comms team
       return new Intl.DateTimeFormat("en-US", {
         timeZone: "America/New_York",
         weekday: "short",
@@ -71,11 +84,23 @@ export default async function handler(req, res) {
       }).format(d);
     }
 
+    function dedupeById(items) {
+      const seen = new Set();
+      const out = [];
+      for (const item of items) {
+        if (!item?.id) continue;
+        if (seen.has(item.id)) continue;
+        seen.add(item.id);
+        out.push(item);
+      }
+      return out;
+    }
+
     // ---- CALENDAR: pull event instances (occurrences) ----
     async function getUpcomingCalendarInstances() {
       const perPage = 100;
-      const maxEventPages = 10; // parent events pages
-      const maxInstancePages = 4; // instances per event
+      const maxEventPages = 10;
+      const maxInstancePages = 4;
       const instanceLimitPerEvent = 200;
 
       const collected = [];
@@ -140,22 +165,23 @@ export default async function handler(req, res) {
             if (instances.length < perPage) break;
             if (instanceCountForThisEvent >= instanceLimitPerEvent) break;
           }
-
-          if (collected.length >= limit) break;
         }
 
-        if (collected.length >= limit) break;
         if (parents.length < perPage) break;
       }
 
-      const sorted = collected
+      const deduped = dedupeById(collected);
+
+      const sorted = deduped
         .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
         .slice(0, limit);
 
       return {
         events: sorted,
         parentEventsScanned,
-        instancesScanned
+        instancesScanned,
+        collectedCount: collected.length,
+        dedupedCount: deduped.length
       };
     }
 
@@ -214,11 +240,12 @@ export default async function handler(req, res) {
 
         collected.push(...regs);
 
-        if (collected.length >= limit) break;
         if ((json?.data || []).length < perPage) break;
       }
 
-      return collected
+      const deduped = dedupeById(collected);
+
+      return deduped
         .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
         .slice(0, limit);
     }
@@ -234,7 +261,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const merged = [...cal.events, ...registrationEvents]
+    const merged = dedupeById([...cal.events, ...registrationEvents])
       .sort((a, b) => (a.start_epoch ?? 0) - (b.start_epoch ?? 0))
       .slice(0, limit);
 
@@ -250,6 +277,8 @@ export default async function handler(req, res) {
       response.debug = {
         calendar_parent_events_scanned: cal.parentEventsScanned,
         calendar_instances_scanned: cal.instancesScanned,
+        calendar_collected: cal.collectedCount,
+        calendar_deduped: cal.dedupedCount,
         returned_calendar_events: cal.events.length,
         returned_registration_events: registrationEvents.length
       };
